@@ -41,6 +41,7 @@ import (
 	"github.com/charmbracelet/crush/internal/ui/styles"
 	"github.com/charmbracelet/crush/internal/update"
 	"github.com/charmbracelet/crush/internal/version"
+	"github.com/charmbracelet/crush/pkg/ext"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 )
@@ -61,6 +62,7 @@ type App struct {
 	FileTracker filetracker.Service
 
 	AgentCoordinator agent.Coordinator
+	Extensions       *ext.Manager
 
 	LSPManager *lsp.Manager
 
@@ -126,6 +128,12 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		runCompletions:     pubsub.NewBroker[notify.RunComplete](),
 	}
+
+	extensions := ext.NewManager(store.WorkingDir())
+	if err := extensions.DiscoverAndLoad(); err != nil {
+		slog.Warn("Failed scanning extensions", "error", err)
+	}
+	app.Extensions = extensions
 
 	app.setupEvents()
 
@@ -694,6 +702,7 @@ func (app *App) initCoderAgent(ctx context.Context, interactive bool) error {
 		RunComplete: app.runCompletions,
 		Skills:      app.Skills,
 		Interactive: interactive,
+		Extensions:  app.Extensions,
 	})
 	if err != nil {
 		slog.Error("Failed to create coder agent", "err", err)

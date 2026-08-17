@@ -10,31 +10,33 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/pkg/ext"
 	"github.com/tidwall/sjson"
 )
 
-// hookedTool wraps a fantasy.AgentTool to run PreToolUse hooks before
-// delegating to the inner tool.
+// hookedTool wraps a fantasy.AgentTool to run PreToolUse hooks and extension event
+// handlers before and after delegating to the inner tool.
 type hookedTool struct {
-	inner  fantasy.AgentTool
-	runner *hooks.Runner
+	inner    fantasy.AgentTool
+	runner   *hooks.Runner
+	eventBus *ext.EventBus
 }
 
-func newHookedTool(inner fantasy.AgentTool, runner *hooks.Runner) *hookedTool {
-	return &hookedTool{inner: inner, runner: runner}
+func newHookedTool(inner fantasy.AgentTool, runner *hooks.Runner, eventBus *ext.EventBus) *hookedTool {
+	return &hookedTool{inner: inner, runner: runner, eventBus: eventBus}
 }
 
 // wrapToolsWithHooks returns a tool slice with each entry wrapped in a
-// hookedTool. Returns the original slice unchanged when runner is nil or
+// hookedTool. Returns the original slice unchanged when runner and eventBus are nil or
 // when isSubAgent is true — sub-agents never fire hooks, the top-level
 // invocation of the sub-agent tool itself is wrapped on the caller's side.
-func wrapToolsWithHooks(tools []fantasy.AgentTool, runner *hooks.Runner, isSubAgent bool) []fantasy.AgentTool {
-	if runner == nil || isSubAgent {
+func wrapToolsWithHooks(tools []fantasy.AgentTool, runner *hooks.Runner, eventBus *ext.EventBus, isSubAgent bool) []fantasy.AgentTool {
+	if (runner == nil && eventBus == nil) || isSubAgent {
 		return tools
 	}
 	out := make([]fantasy.AgentTool, len(tools))
 	for i, tool := range tools {
-		out[i] = newHookedTool(tool, runner)
+		out[i] = newHookedTool(tool, runner, eventBus)
 	}
 	return out
 }
@@ -53,39 +55,77 @@ func (h *hookedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 
 func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	sessionID := tools.GetSessionFromContext(ctx)
-	result, err := h.runner.Run(ctx, hooks.EventPreToolUse, sessionID, call.Name, call.Input)
-	if err != nil {
-		slog.Warn("Hook execution error, proceeding with tool call",
-			"tool", call.Name, "error", err)
-	}
 
-	if result.Decision == hooks.DecisionDeny || result.Halt {
-		reason := fmt.Sprintf("Tool call blocked by hook. Reason: %s", result.Reason)
-		if result.Halt {
-			reason = fmt.Sprintf("Turn halted by hook. Reason: %s", result.Reason)
+	if h.eventBus != nil {
+		var argsMap map[string]any
+		var cmd string
+		if call.Input != "" {
+			_ = json.Unmarshal([]byte(call.Input), &argsMap)
+			if c, ok := argsMap["command"].(string); ok {
+				cmd = c
+			}
 		}
-		resp := fantasy.NewTextErrorResponse(reason)
-		// Halt ends the whole turn; a plain deny only blocks this tool
-		// call so the model can see the error and try something else.
-		resp.StopTurn = result.Halt
-		resp.Metadata = hookMetadataJSON(result)
-		return resp, nil
+		extDecision, err := h.eventBus.Emit(ext.Event{
+			Name:      ext.EventToolCall,
+			SessionID: sessionID,
+			Tool:      call.Name,
+			Command:   cmd,
+			Args:      argsMap,
+		})
+		if err != nil {
+			slog.Warn("Extension tool_call hook error", "tool", call.Name, "error", err)
+		}
+		if extDecision == ext.Deny {
+			return fantasy.NewTextErrorResponse("Tool call blocked by extension hook"), nil
+		}
 	}
 
-	if result.UpdatedInput != "" {
-		call.Input = result.UpdatedInput
-	}
+	var result hooks.AggregateResult
+	if h.runner != nil {
+		var err error
+		result, err = h.runner.Run(ctx, hooks.EventPreToolUse, sessionID, call.Name, call.Input)
+		if err != nil {
+			slog.Warn("Hook execution error, proceeding with tool call",
+				"tool", call.Name, "error", err)
+		}
 
-	// An explicit allow from a hook pre-approves the permission prompt for
-	// this tool call. Deny is already handled above; silence falls through
-	// to the normal permission flow.
-	if result.Decision == hooks.DecisionAllow {
-		ctx = permission.WithHookApproval(ctx, call.ID)
+		if result.Decision == hooks.DecisionDeny || result.Halt {
+			reason := fmt.Sprintf("Tool call blocked by hook. Reason: %s", result.Reason)
+			if result.Halt {
+				reason = fmt.Sprintf("Turn halted by hook. Reason: %s", result.Reason)
+			}
+			resp := fantasy.NewTextErrorResponse(reason)
+			// Halt ends the whole turn; a plain deny only blocks this tool
+			// call so the model can see the error and try something else.
+			resp.StopTurn = result.Halt
+			resp.Metadata = hookMetadataJSON(result)
+			return resp, nil
+		}
+
+		if result.UpdatedInput != "" {
+			call.Input = result.UpdatedInput
+		}
+
+		// An explicit allow from a hook pre-approves the permission prompt for
+		// this tool call. Deny is already handled above; silence falls through
+		// to the normal permission flow.
+		if result.Decision == hooks.DecisionAllow {
+			ctx = permission.WithHookApproval(ctx, call.ID)
+		}
 	}
 
 	resp, err := h.inner.Run(ctx, call)
 	if err != nil {
 		return resp, err
+	}
+
+	if h.eventBus != nil {
+		_, _ = h.eventBus.Emit(ext.Event{
+			Name:      ext.EventToolResult,
+			SessionID: sessionID,
+			Tool:      call.Name,
+			Result:    resp.Content,
+		})
 	}
 
 	if result.Context != "" {

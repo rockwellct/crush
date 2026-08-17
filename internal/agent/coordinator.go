@@ -40,6 +40,7 @@ import (
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/pkg/ext"
 	"golang.org/x/sync/errgroup"
 
 	"charm.land/fantasy/providers/anthropic"
@@ -123,6 +124,7 @@ type coordinator struct {
 	notify      pubsub.Publisher[notify.Notification]
 	runComplete pubsub.Publisher[notify.RunComplete]
 	interactive bool
+	extensions  *ext.Manager
 
 	currentAgent SessionAgent
 	agents       map[string]SessionAgent
@@ -151,6 +153,7 @@ type CoordinatorOptions struct {
 	RunComplete pubsub.Publisher[notify.RunComplete]
 	Skills      *skills.Manager
 	Interactive bool
+	Extensions  *ext.Manager
 }
 
 func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, error) {
@@ -178,11 +181,12 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		lspManager:   opts.LSPManager,
 		notify:       opts.Notify,
 		runComplete:  opts.RunComplete,
+		interactive:  opts.Interactive,
+		extensions:   opts.Extensions,
 		agents:       make(map[string]SessionAgent),
 		allSkills:    allSkills,
 		activeSkills: activeSkills,
 		skillTracker: skillTracker,
-		interactive:  opts.Interactive,
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
@@ -223,6 +227,19 @@ func (c *coordinator) RunAccepted(ctx context.Context, accept *AcceptedRun, sess
 func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	if err := c.readyWg.Wait(); err != nil {
 		return nil, err
+	}
+
+	if c.extensions != nil {
+		res, err := c.extensions.EventBus().Emit(ext.Event{
+			Name:      ext.EventInput,
+			SessionID: sessionID,
+			Prompt:    prompt,
+		})
+		if err == nil {
+			if modifiedPrompt, ok := res.(string); ok && modifiedPrompt != "" {
+				prompt = modifiedPrompt
+			}
+		}
 	}
 
 	// MCP servers connect asynchronously (see mcp.Initialize).
@@ -788,6 +805,11 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 			slog.Debug("MCP not allowed", "tool", tool.Name(), "agent", agent.Name)
 		}
 	}
+
+	if c.extensions != nil {
+		filteredTools = append(filteredTools, c.extensions.AgentTools()...)
+	}
+
 	slices.SortFunc(filteredTools, func(a, b fantasy.AgentTool) int {
 		return strings.Compare(a.Info().Name, b.Info().Name)
 	})
@@ -797,7 +819,11 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	// without hook interception to avoid firing the user's hook N times
 	// per delegated turn. The top-level invocation of the sub-agent tool
 	// itself is still wrapped from the coder's side.
-	filteredTools = wrapToolsWithHooks(filteredTools, hookRunner, isSubAgent)
+	var extBus *ext.EventBus
+	if c.extensions != nil {
+		extBus = c.extensions.EventBus()
+	}
+	filteredTools = wrapToolsWithHooks(filteredTools, hookRunner, extBus, isSubAgent)
 
 	return filteredTools, nil
 }

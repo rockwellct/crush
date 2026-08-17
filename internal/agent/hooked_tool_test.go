@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/pkg/ext"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,7 +52,7 @@ func TestHookedTool_AllowStampsHookApproval(t *testing.T) {
 
 	inner := &fakeTool{name: "view", resp: fantasy.NewTextResponse("ok")}
 	runner := newRunner(t, `echo '{"decision":"allow"}'`)
-	tool := newHookedTool(inner, runner)
+	tool := newHookedTool(inner, runner, nil)
 
 	_, err := tool.Run(t.Context(), fantasy.ToolCall{ID: "call-1", Name: "view"})
 	require.NoError(t, err)
@@ -75,7 +76,7 @@ func TestHookedTool_SilentDoesNotStampApproval(t *testing.T) {
 
 	inner := &fakeTool{name: "view", resp: fantasy.NewTextResponse("ok")}
 	runner := newRunner(t, `exit 0`) // no stdout, no decision
-	tool := newHookedTool(inner, runner)
+	tool := newHookedTool(inner, runner, nil)
 
 	_, err := tool.Run(t.Context(), fantasy.ToolCall{ID: "call-2", Name: "view"})
 	require.NoError(t, err)
@@ -104,13 +105,49 @@ func TestHookedTool_DenySkipsInnerTool(t *testing.T) {
 
 	inner := &fakeTool{name: "bash"}
 	runner := newRunner(t, `echo "blocked" >&2; exit 2`)
-	tool := newHookedTool(inner, runner)
+	tool := newHookedTool(inner, runner, nil)
 
 	resp, err := tool.Run(t.Context(), fantasy.ToolCall{ID: "call-3", Name: "bash"})
 	require.NoError(t, err)
 	require.False(t, inner.called, "denied call must not reach the inner tool")
 	require.True(t, resp.IsError)
 	require.Contains(t, resp.Content, "blocked")
+}
+
+func TestHookedTool_ExtensionEventBus(t *testing.T) {
+	t.Parallel()
+
+	bus := ext.NewEventBus()
+	bus.Subscribe(ext.EventToolCall, func(evt ext.Event) (any, error) {
+		if evt.Command == "blocked_by_ext" {
+			return ext.Deny, nil
+		}
+		return ext.AllowOnce, nil
+	})
+
+	inner := &fakeTool{name: "bash", resp: fantasy.NewTextResponse("executed")}
+	tool := newHookedTool(inner, nil, bus)
+
+	// Blocked call
+	resp, err := tool.Run(t.Context(), fantasy.ToolCall{
+		ID:    "call-4",
+		Name:  "bash",
+		Input: `{"command":"blocked_by_ext"}`,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.IsError)
+	require.False(t, inner.called)
+
+	// Allowed call
+	resp, err = tool.Run(t.Context(), fantasy.ToolCall{
+		ID:    "call-5",
+		Name:  "bash",
+		Input: `{"command":"echo hi"}`,
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+	require.True(t, inner.called)
+	require.Equal(t, "executed", resp.Content)
 }
 
 func TestWrapToolsWithHooks(t *testing.T) {
@@ -121,7 +158,7 @@ func TestWrapToolsWithHooks(t *testing.T) {
 
 	t.Run("top-level agent wraps every tool", func(t *testing.T) {
 		t.Parallel()
-		out := wrapToolsWithHooks(inputs, runner, false)
+		out := wrapToolsWithHooks(inputs, runner, nil, false)
 		require.Len(t, out, len(inputs))
 		for i, tool := range out {
 			_, ok := tool.(*hookedTool)
@@ -131,7 +168,7 @@ func TestWrapToolsWithHooks(t *testing.T) {
 
 	t.Run("sub-agent skips the wrap", func(t *testing.T) {
 		t.Parallel()
-		out := wrapToolsWithHooks(inputs, runner, true)
+		out := wrapToolsWithHooks(inputs, runner, nil, true)
 		require.Equal(t, inputs, out, "sub-agent tools should be returned unwrapped")
 		for _, tool := range out {
 			_, isHooked := tool.(*hookedTool)
@@ -139,9 +176,9 @@ func TestWrapToolsWithHooks(t *testing.T) {
 		}
 	})
 
-	t.Run("nil runner skips the wrap for both agent kinds", func(t *testing.T) {
+	t.Run("nil runner and bus skips the wrap for both agent kinds", func(t *testing.T) {
 		t.Parallel()
-		require.Equal(t, inputs, wrapToolsWithHooks(inputs, nil, false))
-		require.Equal(t, inputs, wrapToolsWithHooks(inputs, nil, true))
+		require.Equal(t, inputs, wrapToolsWithHooks(inputs, nil, nil, false))
+		require.Equal(t, inputs, wrapToolsWithHooks(inputs, nil, nil, true))
 	})
 }
