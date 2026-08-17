@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/pkg/ext"
 	"github.com/stretchr/testify/require"
 )
 
@@ -502,4 +503,29 @@ func TestCrushInfo_Hooks_NoHooks(t *testing.T) {
 
 	output := buildCrushInfo(cfg, nil, nil, nil, nil)
 	require.NotContains(t, output, "[hooks]")
+}
+
+func TestCrushInfo_Extensions(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.NewTestStore(&config.Config{
+		Providers: csync.NewMap[string, config.ProviderConfig](),
+	})
+
+	mgr := ext.NewManager(t.TempDir())
+	err := mgr.RegisterTool(ext.ToolDef{
+		Name:        "custom_deploy",
+		Description: "Custom deployment tool",
+	})
+	require.NoError(t, err)
+
+	mgr.RegisterCommand("status_check", "Check status", func(args []string) error {
+		return nil
+	})
+
+	output := buildCrushInfo(cfg, nil, nil, nil, nil, mgr)
+	require.Contains(t, output, "[extensions]")
+	require.Contains(t, output, "system = runtime_dynamic (dual-engine)")
+	require.Contains(t, output, "registered_tools = custom_deploy")
+	require.Contains(t, output, "registered_commands = status_check")
 }

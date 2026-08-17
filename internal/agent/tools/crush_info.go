@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/pkg/ext"
 )
 
 const CrushInfoToolName = "crush_info"
@@ -27,17 +28,26 @@ func NewCrushInfoTool(
 	allSkills []*skills.Skill,
 	activeSkills []*skills.Skill,
 	skillTracker *skills.Tracker,
+	extensions ...*ext.Manager,
 ) fantasy.AgentTool {
+	var extMgr *ext.Manager
+	if len(extensions) > 0 {
+		extMgr = extensions[0]
+	}
 	return fantasy.NewAgentTool(
 		CrushInfoToolName,
 		crushInfoDescription,
 		func(ctx context.Context, _ CrushInfoParams, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			return fantasy.NewTextResponse(buildCrushInfo(cfg, lspManager, allSkills, activeSkills, skillTracker)), nil
+			return fantasy.NewTextResponse(buildCrushInfo(cfg, lspManager, allSkills, activeSkills, skillTracker, extMgr)), nil
 		},
 	)
 }
 
-func buildCrushInfo(cfg *config.ConfigStore, lspManager *lsp.Manager, allSkills []*skills.Skill, activeSkills []*skills.Skill, skillTracker *skills.Tracker) string {
+func buildCrushInfo(cfg *config.ConfigStore, lspManager *lsp.Manager, allSkills []*skills.Skill, activeSkills []*skills.Skill, skillTracker *skills.Tracker, extensions ...*ext.Manager) string {
+	var extMgr *ext.Manager
+	if len(extensions) > 0 {
+		extMgr = extensions[0]
+	}
 	var b strings.Builder
 
 	writeConfigFiles(&b, cfg)
@@ -48,6 +58,7 @@ func buildCrushInfo(cfg *config.ConfigStore, lspManager *lsp.Manager, allSkills 
 	writeMCP(&b, mcp.GetStates(), cfg)
 	writeSkills(&b, allSkills, activeSkills, skillTracker, cfg)
 	writeHooks(&b, cfg)
+	writeExtensions(&b, extMgr)
 	writePermissions(&b, cfg)
 	writeDisabledTools(&b, cfg)
 	writeOptions(&b, cfg)
@@ -462,6 +473,59 @@ func writeHooks(b *strings.Builder, cfg *config.ConfigStore) {
 			line += fmt.Sprintf(" (timeout: %ds)", e.timeout)
 		}
 		b.WriteString(line + "\n")
+	}
+
+	b.WriteString("\n")
+}
+
+func writeExtensions(b *strings.Builder, extensions *ext.Manager) {
+	b.WriteString("[extensions]\n")
+	b.WriteString("system = runtime_dynamic (dual-engine)\n")
+	b.WriteString("engines = Lua (gopher-lua: *.lua), Go (yaegi: *.go)\n")
+	b.WriteString("discovery_paths = ~/.config/crush/plugins/, .crush/plugins/\n")
+	b.WriteString("lifecycle_events = session_start, session_end, input, tool_call, tool_result, message_update\n")
+	b.WriteString("ui_widgets = header, sidebar, modal (tea.Model)\n")
+
+	if extensions != nil {
+		tools := extensions.AgentTools()
+		if len(tools) > 0 {
+			var names []string
+			for _, t := range tools {
+				names = append(names, t.Info().Name)
+			}
+			slices.Sort(names)
+			fmt.Fprintf(b, "registered_tools = %s\n", strings.Join(names, ", "))
+		} else {
+			b.WriteString("registered_tools = none\n")
+		}
+
+		commands := extensions.Commands()
+		if len(commands) > 0 {
+			var names []string
+			for name := range commands {
+				names = append(names, name)
+			}
+			slices.Sort(names)
+			fmt.Fprintf(b, "registered_commands = %s\n", strings.Join(names, ", "))
+		} else {
+			b.WriteString("registered_commands = none\n")
+		}
+
+		keybindings := extensions.Keybindings()
+		if len(keybindings) > 0 {
+			var keys []string
+			for k := range keybindings {
+				keys = append(keys, k)
+			}
+			slices.Sort(keys)
+			fmt.Fprintf(b, "registered_keybindings = %s\n", strings.Join(keys, ", "))
+		} else {
+			b.WriteString("registered_keybindings = none\n")
+		}
+	} else {
+		b.WriteString("registered_tools = none\n")
+		b.WriteString("registered_commands = none\n")
+		b.WriteString("registered_keybindings = none\n")
 	}
 
 	b.WriteString("\n")
